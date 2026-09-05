@@ -1,0 +1,11 @@
+name: Linux Web Terminal
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: fawazahmed0/action-debug@main
