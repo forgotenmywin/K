@@ -8,4 +8,133 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: fawazahmed0/action-debug@main
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip curl
+
+      - name: Install cloudflared
+        run: |
+          curl -L --output cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+
+          cloudflared --version
+
+      - name: Create API
+        run: |
+          cat > /tmp/server.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          import json
+          import subprocess
+          import os
+
+          TOKEN = os.environ["API_TOKEN"]
+
+          class Handler(BaseHTTPRequestHandler):
+
+              def do_POST(self):
+                  if self.path != "/command":
+                      self.send_response(404)
+                      self.end_headers()
+                      return
+
+                  auth = self.headers.get("Authorization", "")
+
+                  if auth != f"Bearer {TOKEN}":
+                      self.send_response(401)
+                      self.end_headers()
+                      self.wfile.write(b"Unauthorized")
+                      return
+
+                  length = int(self.headers.get("Content-Length", 0))
+                  body = self.rfile.read(length)
+
+                  try:
+                      data = json.loads(body)
+                      command = data["command"]
+
+                      result = subprocess.run(
+                          command,
+                          shell=True,
+                          capture_output=True,
+                          text=True,
+                          timeout=60
+                      )
+
+                      response = {
+                          "returncode": result.returncode,
+                          "stdout": result.stdout,
+                          "stderr": result.stderr
+                      }
+
+                      output = json.dumps(response).encode()
+
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(output)))
+                      self.end_headers()
+                      self.wfile.write(output)
+
+                  except Exception as e:
+                      output = json.dumps({
+                          "error": str(e)
+                      }).encode()
+
+                      self.send_response(500)
+                      self.send_header("Content-Type", "application/json")
+                      self.end_headers()
+                      self.wfile.write(output)
+
+          server = HTTPServer(("127.0.0.1", 8080), Handler)
+
+          print("API listening on 127.0.0.1:8080", flush=True)
+
+          server.serve_forever()
+          PY
+
+      - name: Generate API token
+        run: |
+          TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+
+          echo "API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+          echo "::add-mask::$TOKEN"
+
+      - name: Start API
+        run: |
+          nohup python3 /tmp/server.py > /tmp/api.log 2>&1 &
+
+          sleep 2
+
+          cat /tmp/api.log
+
+      - name: Start Cloudflare Tunnel
+        run: |
+          nohup cloudflared tunnel --url http://127.0.0.1:8080 \
+            > /tmp/cloudflared.log 2>&1 &
+
+          sleep 5
+
+          URL=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+
+          echo "=========================================="
+          echo "RUNNER API URL:"
+          echo "$URL"
+          echo "=========================================="
+
+          echo "API endpoint:"
+          echo "$URL/command"
+
+          echo "=========================================="
+
+      - name: Keep runner alive
+        run: |
+          echo "Runner is ready."
+          echo "Waiting for commands..."
+
+          while true; do
+            sleep 60
+          done
