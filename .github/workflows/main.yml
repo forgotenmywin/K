@@ -9,17 +9,11 @@ jobs:
 
     steps:
 
-      # ==========================================
-      # Install dependencies
-      # ==========================================
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y python3 curl
 
-      # ==========================================
-      # Install cloudflared
-      # ==========================================
       - name: Install cloudflared
         run: |
           curl -L \
@@ -31,9 +25,6 @@ jobs:
 
           cloudflared --version
 
-      # ==========================================
-      # Generate API token
-      # ==========================================
       - name: Generate API token
         run: |
           TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
@@ -48,9 +39,6 @@ jobs:
           echo "=========================================="
           echo
 
-      # ==========================================
-      # Create PTY API server
-      # ==========================================
       - name: Create PTY API
         run: |
           cat > /tmp/server.py <<'PY'
@@ -58,21 +46,20 @@ jobs:
           import json
           import time
           import select
-          import signal
           import threading
           import pty
-          import sys
+          import re
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
           TOKEN = os.environ["API_TOKEN"]
 
-          # --------------------------------------
-          # Start a REAL interactive shell in PTY
-          # --------------------------------------
+          # --------------------------------------------------
+          # Create a REAL interactive Bash PTY
+          # --------------------------------------------------
+
           pid, fd = pty.fork()
 
           if pid == 0:
-              # Child process
               os.execvp(
                   "bash",
                   [
@@ -83,47 +70,62 @@ jobs:
                   ]
               )
 
-          # --------------------------------------
-          # Parent process
-          # --------------------------------------
-
+          # Unique prompt used to detect command completion
           PROMPT = "__REMOTE_PTY_READY_7F31__"
 
-          # Set a unique prompt
+          # Set prompt inside the real shell
           os.write(
               fd,
-              f"export PS1='{PROMPT}'".encode() + b"\n"
+              (
+                  "export PS1='"
+                  + PROMPT
+                  + "'; "
+                  "export PS2=''; "
+                  "export TERM=xterm-256color\n"
+              ).encode()
           )
 
-          # Wait until prompt appears
+          # Give Bash time to initialize
           time.sleep(0.5)
 
+          # Drain startup output
           try:
-              os.read(fd, 65536)
-          except:
+              while True:
+                  ready, _, _ = select.select(
+                      [fd],
+                      [],
+                      [],
+                      0
+                  )
+
+                  if not ready:
+                      break
+
+                  os.read(fd, 65536)
+
+          except OSError:
               pass
 
           lock = threading.Lock()
 
-          # --------------------------------------
-          # Read from PTY until prompt appears
-          # --------------------------------------
-          def read_until_prompt(timeout=60):
+          # --------------------------------------------------
+          # Read EVERYTHING from the PTY until prompt appears
+          # --------------------------------------------------
+
+          def read_until_prompt(timeout=300):
+
               data = b""
               end_time = time.time() + timeout
 
               while time.time() < end_time:
 
-                  remaining = max(
-                      0.1,
-                      end_time - time.time()
-                  )
+                  remaining = end_time - time.time()
 
                   readable, _, _ = select.select(
                       [fd],
                       [],
                       [],
-                      min(1.0, remaining)
+                      min(1.0, max(0.1, remaining))
                   )
 
                   if not readable:
@@ -140,46 +142,38 @@ jobs:
 
                   data += chunk
 
+                  # Prompt means Bash finished the command
                   if PROMPT.encode() in data:
                       break
 
               return data
 
-          # --------------------------------------
-          # Clean terminal output
-          # --------------------------------------
+          # --------------------------------------------------
+          # Remove ONLY our artificial prompt.
+          #
+          # We intentionally DO NOT remove ANSI escape codes,
+          # colors, carriage returns, etc.
+          # --------------------------------------------------
+
           def clean_output(data):
+
               text = data.decode(
                   "utf-8",
                   errors="replace"
               )
 
-              # Remove prompt
+              # Remove our artificial prompt
               text = text.replace(
                   PROMPT,
                   ""
               )
 
-              # Remove ANSI escape sequences
-              import re
+              return text
 
-              text = re.sub(
-                  r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])",
-                  "",
-                  text
-              )
-
-              # Remove carriage returns
-              text = text.replace(
-                  "\r",
-                  ""
-              )
-
-              return text.strip()
-
-          # --------------------------------------
+          # --------------------------------------------------
           # HTTP API
-          # --------------------------------------
+          # --------------------------------------------------
+
           class Handler(BaseHTTPRequestHandler):
 
               def log_message(self, format, *args):
@@ -190,10 +184,11 @@ jobs:
                   )
 
               def send_json(self, status, data):
+
                   body = json.dumps(
                       data,
                       ensure_ascii=False
-                  ).encode()
+                  ).encode("utf-8")
 
                   self.send_response(status)
 
@@ -211,9 +206,10 @@ jobs:
 
                   self.wfile.write(body)
 
-              # ------------------------------
-              # GET /
-              # ------------------------------
+              # ------------------------------------------------
+              # Health check
+              # ------------------------------------------------
+
               def do_GET(self):
 
                   if self.path == "/":
@@ -223,6 +219,7 @@ jobs:
                           {
                               "status": "online",
                               "type": "real-pty",
+                              "shell": "bash",
                               "endpoint": "/command"
                           }
                       )
@@ -236,9 +233,10 @@ jobs:
                       }
                   )
 
-              # ------------------------------
-              # POST /command
-              # ------------------------------
+              # ------------------------------------------------
+              # Execute command in the REAL PTY
+              # ------------------------------------------------
+
               def do_POST(self):
 
                   if self.path != "/command":
@@ -252,9 +250,7 @@ jobs:
 
                       return
 
-                  # --------------------------
-                  # Check token
-                  # --------------------------
+                  # Authentication
                   auth = self.headers.get(
                       "Authorization",
                       ""
@@ -273,9 +269,6 @@ jobs:
 
                   try:
 
-                      # ----------------------
-                      # Read JSON
-                      # ----------------------
                       length = int(
                           self.headers.get(
                               "Content-Length",
@@ -283,17 +276,11 @@ jobs:
                           )
                       )
 
-                      body = self.rfile.read(
-                          length
-                      )
+                      body = self.rfile.read(length)
 
-                      data = json.loads(
-                          body
-                      )
+                      request = json.loads(body)
 
-                      command = data.get(
-                          "command"
-                      )
+                      command = request.get("command")
 
                       if not command:
 
@@ -308,36 +295,57 @@ jobs:
                           return
 
                       print(
-                          f"[PTY COMMAND] {command}",
+                          "==========================================",
                           flush=True
                       )
 
-                      # ----------------------
-                      # Lock PTY
-                      # ----------------------
+                      print(
+                          "[PTY COMMAND]",
+                          command,
+                          flush=True
+                      )
+
+                      # Only one command can use the PTY
+                      # at a time.
                       with lock:
 
-                          # Write the command
+                          # Write command into the real
+                          # interactive Bash terminal.
                           os.write(
                               fd,
-                              command.encode(
-                                  "utf-8"
-                              )
+                              command.encode("utf-8")
                           )
 
-                          # Write ENTER
+                          # Press Enter
                           os.write(
                               fd,
                               b"\n"
                           )
 
-                          # Read resulting terminal output
+                          # Read everything Bash prints
                           output = read_until_prompt(
-                              timeout=60
+                              timeout=300
                           )
 
                       output = clean_output(
                           output
+                      )
+
+                      # Print complete output to
+                      # GitHub Actions log too.
+                      print(
+                          "[PTY OUTPUT]",
+                          flush=True
+                      )
+
+                      print(
+                          output,
+                          flush=True
+                      )
+
+                      print(
+                          "==========================================",
+                          flush=True
                       )
 
                       self.send_json(
@@ -351,6 +359,12 @@ jobs:
 
                   except Exception as e:
 
+                      print(
+                          "[ERROR]",
+                          str(e),
+                          flush=True
+                      )
+
                       self.send_json(
                           500,
                           {
@@ -359,9 +373,11 @@ jobs:
                           }
                       )
 
-          # --------------------------------------
+
+          # --------------------------------------------------
           # Start HTTP server
-          # --------------------------------------
+          # --------------------------------------------------
+
           server = ThreadingHTTPServer(
               (
                   "127.0.0.1",
@@ -381,7 +397,17 @@ jobs:
           )
 
           print(
-              "127.0.0.1:8080",
+              "Shell: bash -i",
+              flush=True
+          )
+
+          print(
+              "PTY: REAL",
+              flush=True
+          )
+
+          print(
+              "Listening: 127.0.0.1:8080",
               flush=True
           )
 
@@ -393,9 +419,6 @@ jobs:
           server.serve_forever()
           PY
 
-      # ==========================================
-      # Start API
-      # ==========================================
       - name: Start PTY API
         run: |
           nohup python3 /tmp/server.py \
@@ -413,12 +436,8 @@ jobs:
           echo "=========================================="
           echo
 
-      # ==========================================
-      # Start Cloudflare Tunnel
-      # ==========================================
       - name: Start Cloudflare Tunnel
         run: |
-
           nohup cloudflared tunnel \
             --url http://127.0.0.1:8080 \
             > /tmp/cloudflared.log 2>&1 &
@@ -449,22 +468,18 @@ jobs:
           echo "$API_TOKEN"
           echo
           echo "=========================================="
-          echo "EXAMPLE:"
+          echo "TEST:"
           echo "=========================================="
           echo
           echo "curl -X POST \"$URL/command\" \\"
           echo "  -H \"Authorization: Bearer $API_TOKEN\" \\"
           echo "  -H \"Content-Type: application/json\" \\"
-          echo "  -d '{\"command\":\"echo hello\"}'"
+          echo "  -d '{\"command\":\"whoami && id\"}'"
           echo
           echo "=========================================="
 
-      # ==========================================
-      # Keep runner alive
-      # ==========================================
       - name: Keep runner alive
         run: |
-
           echo
           echo "=========================================="
           echo "REAL PTY RUNNER READY"
