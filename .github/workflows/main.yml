@@ -24,6 +24,21 @@ jobs:
 
           cloudflared --version
 
+      - name: Generate API token
+        id: token
+        run: |
+          TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+
+          echo "API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+          echo
+          echo "=========================================="
+          echo "             API TOKEN"
+          echo "=========================================="
+          echo "$TOKEN"
+          echo "=========================================="
+          echo
+
       - name: Create API
         run: |
           cat > /tmp/server.py <<'PY'
@@ -123,16 +138,18 @@ jobs:
           PY
 
       - name: Start API
-        env:
-          API_TOKEN: ${{ secrets.API_TOKEN }}
         run: |
           nohup python3 /tmp/server.py > /tmp/api.log 2>&1 &
 
           sleep 2
 
-          echo "========== API SERVER =========="
+          echo
+          echo "=========================================="
+          echo "             API SERVER"
+          echo "=========================================="
           cat /tmp/api.log
-          echo "==============================="
+          echo "=========================================="
+          echo
 
       - name: Start Cloudflare Tunnel
         run: |
@@ -158,6 +175,15 @@ jobs:
           echo
           echo "TEST:"
           echo "$URL/"
+          echo
+          echo "=========================================="
+          echo "             CURL COMMAND"
+          echo "=========================================="
+          echo
+          echo "curl -X POST \"$URL/command\" \\"
+          echo "  -H \"Authorization: Bearer $API_TOKEN\" \\"
+          echo "  -H \"Content-Type: application/json\" \\"
+          echo "  -d '{\"command\":\"echo print\"}'"
           echo
           echo "=========================================="
 
