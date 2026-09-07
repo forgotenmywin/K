@@ -1,31 +1,40 @@
-name: Linux Web Terminal
+name: Linux Remote Terminal
 
 on:
   workflow_dispatch:
 
 jobs:
-  debug:
+  runner:
     runs-on: ubuntu-latest
 
     steps:
+
+      # ==========================================
+      # Install dependencies
+      # ==========================================
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y python3 curl
 
+      # ==========================================
+      # Install cloudflared
+      # ==========================================
       - name: Install cloudflared
         run: |
           curl -L \
-            -o cloudflared \
+            -o /tmp/cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
 
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/cloudflared
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
 
           cloudflared --version
 
+      # ==========================================
+      # Generate API token
+      # ==========================================
       - name: Generate API token
-        id: token
         run: |
           TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
 
@@ -33,165 +42,436 @@ jobs:
 
           echo
           echo "=========================================="
-          echo "             API TOKEN"
+          echo "                 API TOKEN"
           echo "=========================================="
           echo "$TOKEN"
           echo "=========================================="
           echo
 
-      - name: Create API
+      # ==========================================
+      # Create PTY API server
+      # ==========================================
+      - name: Create PTY API
         run: |
           cat > /tmp/server.py <<'PY'
-          from http.server import BaseHTTPRequestHandler, HTTPServer
-          import json
-          import subprocess
           import os
+          import json
+          import time
+          import select
+          import signal
+          import threading
+          import pty
+          import sys
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
           TOKEN = os.environ["API_TOKEN"]
 
+          # --------------------------------------
+          # Start a REAL interactive shell in PTY
+          # --------------------------------------
+          pid, fd = pty.fork()
+
+          if pid == 0:
+              # Child process
+              os.execvp(
+                  "bash",
+                  [
+                      "bash",
+                      "--noprofile",
+                      "--norc",
+                      "-i"
+                  ]
+              )
+
+          # --------------------------------------
+          # Parent process
+          # --------------------------------------
+
+          PROMPT = "__REMOTE_PTY_READY_7F31__"
+
+          # Set a unique prompt
+          os.write(
+              fd,
+              f"export PS1='{PROMPT}'".encode() + b"\n"
+          )
+
+          # Wait until prompt appears
+          time.sleep(0.5)
+
+          try:
+              os.read(fd, 65536)
+          except:
+              pass
+
+          lock = threading.Lock()
+
+          # --------------------------------------
+          # Read from PTY until prompt appears
+          # --------------------------------------
+          def read_until_prompt(timeout=60):
+              data = b""
+              end_time = time.time() + timeout
+
+              while time.time() < end_time:
+
+                  remaining = max(
+                      0.1,
+                      end_time - time.time()
+                  )
+
+                  readable, _, _ = select.select(
+                      [fd],
+                      [],
+                      [],
+                      min(1.0, remaining)
+                  )
+
+                  if not readable:
+                      continue
+
+                  try:
+                      chunk = os.read(fd, 65536)
+
+                  except OSError:
+                      break
+
+                  if not chunk:
+                      break
+
+                  data += chunk
+
+                  if PROMPT.encode() in data:
+                      break
+
+              return data
+
+          # --------------------------------------
+          # Clean terminal output
+          # --------------------------------------
+          def clean_output(data):
+              text = data.decode(
+                  "utf-8",
+                  errors="replace"
+              )
+
+              # Remove prompt
+              text = text.replace(
+                  PROMPT,
+                  ""
+              )
+
+              # Remove ANSI escape sequences
+              import re
+
+              text = re.sub(
+                  r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])",
+                  "",
+                  text
+              )
+
+              # Remove carriage returns
+              text = text.replace(
+                  "\r",
+                  ""
+              )
+
+              return text.strip()
+
+          # --------------------------------------
+          # HTTP API
+          # --------------------------------------
           class Handler(BaseHTTPRequestHandler):
 
+              def log_message(self, format, *args):
+                  print(
+                      "[HTTP]",
+                      format % args,
+                      flush=True
+                  )
+
               def send_json(self, status, data):
-                  body = json.dumps(data).encode()
+                  body = json.dumps(
+                      data,
+                      ensure_ascii=False
+                  ).encode()
 
                   self.send_response(status)
-                  self.send_header("Content-Type", "application/json")
-                  self.send_header("Content-Length", str(len(body)))
+
+                  self.send_header(
+                      "Content-Type",
+                      "application/json; charset=utf-8"
+                  )
+
+                  self.send_header(
+                      "Content-Length",
+                      str(len(body))
+                  )
+
                   self.end_headers()
 
                   self.wfile.write(body)
 
+              # ------------------------------
+              # GET /
+              # ------------------------------
               def do_GET(self):
-                  if self.path == "/":
-                      self.send_json(200, {
-                          "status": "online",
-                          "api": "/command"
-                      })
-                  else:
-                      self.send_json(404, {
-                          "error": "not found"
-                      })
 
-              def do_POST(self):
-                  if self.path != "/command":
-                      self.send_json(404, {
-                          "error": "not found"
-                      })
+                  if self.path == "/":
+
+                      self.send_json(
+                          200,
+                          {
+                              "status": "online",
+                              "type": "real-pty",
+                              "endpoint": "/command"
+                          }
+                      )
+
                       return
 
-                  auth = self.headers.get("Authorization", "")
+                  self.send_json(
+                      404,
+                      {
+                          "error": "not found"
+                      }
+                  )
+
+              # ------------------------------
+              # POST /command
+              # ------------------------------
+              def do_POST(self):
+
+                  if self.path != "/command":
+
+                      self.send_json(
+                          404,
+                          {
+                              "error": "not found"
+                          }
+                      )
+
+                      return
+
+                  # --------------------------
+                  # Check token
+                  # --------------------------
+                  auth = self.headers.get(
+                      "Authorization",
+                      ""
+                  )
 
                   if auth != f"Bearer {TOKEN}":
-                      self.send_json(401, {
-                          "error": "unauthorized"
-                      })
+
+                      self.send_json(
+                          401,
+                          {
+                              "error": "unauthorized"
+                          }
+                      )
+
                       return
 
                   try:
+
+                      # ----------------------
+                      # Read JSON
+                      # ----------------------
                       length = int(
-                          self.headers.get("Content-Length", "0")
+                          self.headers.get(
+                              "Content-Length",
+                              "0"
+                          )
                       )
 
-                      body = self.rfile.read(length)
-                      data = json.loads(body)
+                      body = self.rfile.read(
+                          length
+                      )
 
-                      command = data.get("command")
+                      data = json.loads(
+                          body
+                      )
+
+                      command = data.get(
+                          "command"
+                      )
 
                       if not command:
-                          self.send_json(400, {
-                              "error": "command is required"
-                          })
+
+                          self.send_json(
+                              400,
+                              {
+                                  "error":
+                                  "command is required"
+                              }
+                          )
+
                           return
 
-                      result = subprocess.run(
-                          command,
-                          shell=True,
-                          capture_output=True,
-                          text=True,
-                          timeout=60
+                      print(
+                          f"[PTY COMMAND] {command}",
+                          flush=True
                       )
 
-                      self.send_json(200, {
-                          "returncode": result.returncode,
-                          "stdout": result.stdout,
-                          "stderr": result.stderr
-                      })
+                      # ----------------------
+                      # Lock PTY
+                      # ----------------------
+                      with lock:
 
-                  except subprocess.TimeoutExpired:
-                      self.send_json(408, {
-                          "error": "command timeout"
-                      })
+                          # Write the command
+                          os.write(
+                              fd,
+                              command.encode(
+                                  "utf-8"
+                              )
+                          )
+
+                          # Write ENTER
+                          os.write(
+                              fd,
+                              b"\n"
+                          )
+
+                          # Read resulting terminal output
+                          output = read_until_prompt(
+                              timeout=60
+                          )
+
+                      output = clean_output(
+                          output
+                      )
+
+                      self.send_json(
+                          200,
+                          {
+                              "success": True,
+                              "command": command,
+                              "stdout": output
+                          }
+                      )
 
                   except Exception as e:
-                      self.send_json(500, {
-                          "error": str(e)
-                      })
 
-          server = HTTPServer(
-              ("127.0.0.1", 8080),
+                      self.send_json(
+                          500,
+                          {
+                              "success": False,
+                              "error": str(e)
+                          }
+                      )
+
+          # --------------------------------------
+          # Start HTTP server
+          # --------------------------------------
+          server = ThreadingHTTPServer(
+              (
+                  "127.0.0.1",
+                  8080
+              ),
               Handler
           )
 
-          print("API started on 127.0.0.1:8080", flush=True)
+          print(
+              "==========================================",
+              flush=True
+          )
+
+          print(
+              "REAL PTY TERMINAL API STARTED",
+              flush=True
+          )
+
+          print(
+              "127.0.0.1:8080",
+              flush=True
+          )
+
+          print(
+              "==========================================",
+              flush=True
+          )
 
           server.serve_forever()
           PY
 
-      - name: Start API
+      # ==========================================
+      # Start API
+      # ==========================================
+      - name: Start PTY API
         run: |
-          nohup python3 /tmp/server.py > /tmp/api.log 2>&1 &
+          nohup python3 /tmp/server.py \
+            > /tmp/api.log 2>&1 &
 
-          sleep 2
+          sleep 3
 
           echo
           echo "=========================================="
-          echo "             API SERVER"
+          echo "              PTY API"
           echo "=========================================="
+
           cat /tmp/api.log
+
           echo "=========================================="
           echo
 
+      # ==========================================
+      # Start Cloudflare Tunnel
+      # ==========================================
       - name: Start Cloudflare Tunnel
         run: |
+
           nohup cloudflared tunnel \
             --url http://127.0.0.1:8080 \
             > /tmp/cloudflared.log 2>&1 &
 
+          echo "Waiting for Cloudflare..."
+
           sleep 8
 
-          URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' \
-            /tmp/cloudflared.log | head -1)
+          URL=$(
+            grep -oE \
+            'https://[-a-z0-9]+\.trycloudflare\.com' \
+            /tmp/cloudflared.log |
+            head -1
+          )
 
           echo
           echo "=========================================="
-          echo "           RUNNER API ONLINE"
+          echo "          REAL PTY TERMINAL ONLINE"
           echo "=========================================="
           echo
-          echo "BASE URL:"
+          echo "URL:"
           echo "$URL"
           echo
           echo "API:"
           echo "$URL/command"
           echo
-          echo "TEST:"
-          echo "$URL/"
+          echo "TOKEN:"
+          echo "$API_TOKEN"
           echo
           echo "=========================================="
-          echo "             CURL COMMAND"
+          echo "EXAMPLE:"
           echo "=========================================="
           echo
           echo "curl -X POST \"$URL/command\" \\"
           echo "  -H \"Authorization: Bearer $API_TOKEN\" \\"
           echo "  -H \"Content-Type: application/json\" \\"
-          echo "  -d '{\"command\":\"echo print\"}'"
+          echo "  -d '{\"command\":\"echo hello\"}'"
           echo
           echo "=========================================="
 
+      # ==========================================
+      # Keep runner alive
+      # ==========================================
       - name: Keep runner alive
         run: |
-          echo "Runner is ready."
-          echo "Waiting for commands..."
 
-          while true; do
+          echo
+          echo "=========================================="
+          echo "REAL PTY RUNNER READY"
+          echo "Waiting for commands..."
+          echo "=========================================="
+
+          while true
+          do
             sleep 60
           done
