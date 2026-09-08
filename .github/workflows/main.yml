@@ -11,16 +11,494 @@ jobs:
       actions: write       # برای تنظیم متغیرهای مخزن
 
     steps:
-      # ... (مراحل قبلی مانند نصب، توکن، سرور و تونل بدون تغییر) ...
 
-      - name: Send logs to repo
-        # قبل از این مرحله، مخزن را کلون می‌کنیم
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 curl
+
+      - name: Install cloudflared
+        run: |
+          curl -L \
+            -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+
+          cloudflared --version
+
+      - name: Generate API token
+        run: |
+          TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+
+          echo "API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+          echo
+          echo "=========================================="
+          echo "                 API TOKEN"
+          echo "=========================================="
+          echo "$TOKEN"
+          echo "=========================================="
+          echo
+
+      - name: Create PTY API
+        run: |
+          cat > /tmp/server.py <<'PY'
+          import os
+          import json
+          import time
+          import select
+          import threading
+          import pty
+          import re
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          TOKEN = os.environ["API_TOKEN"]
+
+          # --------------------------------------------------
+          # Create a REAL interactive Bash PTY
+          # --------------------------------------------------
+
+          pid, fd = pty.fork()
+
+          if pid == 0:
+              os.execvp(
+                  "bash",
+                  [
+                      "bash",
+                      "--noprofile",
+                      "--norc",
+                      "-i"
+                  ]
+              )
+
+          # Unique prompt used to detect command completion
+          PROMPT = "__REMOTE_PTY_READY_7F31__"
+
+          # Set prompt inside the real shell
+          os.write(
+              fd,
+              (
+                  "export PS1='"
+                  + PROMPT
+                  + "'; "
+                  "export PS2=''; "
+                  "export TERM=xterm-256color\n"
+              ).encode()
+          )
+
+          # Give Bash time to initialize
+          time.sleep(0.5)
+
+          # Drain startup output
+          try:
+              while True:
+                  ready, _, _ = select.select(
+                      [fd],
+                      [],
+                      [],
+                      0
+                  )
+
+                  if not ready:
+                      break
+
+                  os.read(fd, 65536)
+
+          except OSError:
+              pass
+
+          lock = threading.Lock()
+
+          # --------------------------------------------------
+          # Read EVERYTHING from the PTY until prompt appears
+          # --------------------------------------------------
+
+          def read_until_prompt(timeout=300):
+
+              data = b""
+              end_time = time.time() + timeout
+
+              while time.time() < end_time:
+
+                  remaining = end_time - time.time()
+
+                  readable, _, _ = select.select(
+                      [fd],
+                      [],
+                      [],
+                      min(1.0, max(0.1, remaining))
+                  )
+
+                  if not readable:
+                      continue
+
+                  try:
+                      chunk = os.read(fd, 65536)
+
+                  except OSError:
+                      break
+
+                  if not chunk:
+                      break
+
+                  data += chunk
+
+                  # Prompt means Bash finished the command
+                  if PROMPT.encode() in data:
+                      break
+
+              return data
+
+          # --------------------------------------------------
+          # Remove ONLY our artificial prompt.
+          #
+          # We intentionally DO NOT remove ANSI escape codes,
+          # colors, carriage returns, etc.
+          # --------------------------------------------------
+
+          def clean_output(data):
+
+              text = data.decode(
+                  "utf-8",
+                  errors="replace"
+              )
+
+              # Remove our artificial prompt
+              text = text.replace(
+                  PROMPT,
+                  ""
+              )
+
+              return text
+
+          # --------------------------------------------------
+          # HTTP API
+          # --------------------------------------------------
+
+          class Handler(BaseHTTPRequestHandler):
+
+              def log_message(self, format, *args):
+                  print(
+                      "[HTTP]",
+                      format % args,
+                      flush=True
+                  )
+
+              def send_json(self, status, data):
+
+                  body = json.dumps(
+                      data,
+                      ensure_ascii=False
+                  ).encode("utf-8")
+
+                  self.send_response(status)
+
+                  self.send_header(
+                      "Content-Type",
+                      "application/json; charset=utf-8"
+                  )
+
+                  self.send_header(
+                      "Content-Length",
+                      str(len(body))
+                  )
+
+                  self.end_headers()
+
+                  self.wfile.write(body)
+
+              # ------------------------------------------------
+              # Health check
+              # ------------------------------------------------
+
+              def do_GET(self):
+
+                  if self.path == "/":
+
+                      self.send_json(
+                          200,
+                          {
+                              "status": "online",
+                              "type": "real-pty",
+                              "shell": "bash",
+                              "endpoint": "/command"
+                          }
+                      )
+
+                      return
+
+                  self.send_json(
+                      404,
+                      {
+                          "error": "not found"
+                      }
+                  )
+
+              # ------------------------------------------------
+              # Execute command in the REAL PTY
+              # ------------------------------------------------
+
+              def do_POST(self):
+
+                  if self.path != "/command":
+
+                      self.send_json(
+                          404,
+                          {
+                              "error": "not found"
+                          }
+                      )
+
+                      return
+
+                  # Authentication
+                  auth = self.headers.get(
+                      "Authorization",
+                      ""
+                  )
+
+                  if auth != f"Bearer {TOKEN}":
+
+                      self.send_json(
+                          401,
+                          {
+                              "error": "unauthorized"
+                          }
+                      )
+
+                      return
+
+                  try:
+
+                      length = int(
+                          self.headers.get(
+                              "Content-Length",
+                              "0"
+                          )
+                      )
+
+                      body = self.rfile.read(length)
+
+                      request = json.loads(body)
+
+                      command = request.get("command")
+
+                      if not command:
+
+                          self.send_json(
+                              400,
+                              {
+                                  "error":
+                                  "command is required"
+                              }
+                          )
+
+                          return
+
+                      print(
+                          "==========================================",
+                          flush=True
+                      )
+
+                      print(
+                          "[PTY COMMAND]",
+                          command,
+                          flush=True
+                      )
+
+                      # Only one command can use the PTY
+                      # at a time.
+                      with lock:
+
+                          # Write command into the real
+                          # interactive Bash terminal.
+                          os.write(
+                              fd,
+                              command.encode("utf-8")
+                          )
+
+                          # Press Enter
+                          os.write(
+                              fd,
+                              b"\n"
+                          )
+
+                          # Read everything Bash prints
+                          output = read_until_prompt(
+                              timeout=300
+                          )
+
+                      output = clean_output(
+                          output
+                      )
+
+                      # Print complete output to
+                      # GitHub Actions log too.
+                      print(
+                          "[PTY OUTPUT]",
+                          flush=True
+                      )
+
+                      print(
+                          output,
+                          flush=True
+                      )
+
+                      print(
+                          "==========================================",
+                          flush=True
+                      )
+
+                      self.send_json(
+                          200,
+                          {
+                              "success": True,
+                              "command": command,
+                              "stdout": output
+                          }
+                      )
+
+                  except Exception as e:
+
+                      print(
+                          "[ERROR]",
+                          str(e),
+                          flush=True
+                      )
+
+                      self.send_json(
+                          500,
+                          {
+                              "success": False,
+                              "error": str(e)
+                          }
+                      )
+
+
+          # --------------------------------------------------
+          # Start HTTP server
+          # --------------------------------------------------
+
+          server = ThreadingHTTPServer(
+              (
+                  "127.0.0.1",
+                  8080
+              ),
+              Handler
+          )
+
+          print(
+              "==========================================",
+              flush=True
+          )
+
+          print(
+              "REAL PTY TERMINAL API STARTED",
+              flush=True
+          )
+
+          print(
+              "Shell: bash -i",
+              flush=True
+          )
+
+          print(
+              "PTY: REAL",
+              flush=True
+          )
+
+          print(
+              "Listening: 127.0.0.1:8080",
+              flush=True
+          )
+
+          print(
+              "==========================================",
+              flush=True
+          )
+
+          server.serve_forever()
+          PY
+
+      - name: Start PTY API
+        run: |
+          nohup python3 /tmp/server.py \
+            > /tmp/api.log 2>&1 &
+
+          sleep 3
+
+          echo
+          echo "=========================================="
+          echo "              PTY API"
+          echo "=========================================="
+
+          cat /tmp/api.log
+
+          echo "=========================================="
+          echo
+
+      - name: Start Cloudflare Tunnel
+        run: |
+          nohup cloudflared tunnel \
+            --url http://127.0.0.1:8080 \
+            > /tmp/cloudflared.log 2>&1 &
+
+          echo "Waiting for Cloudflare..."
+
+          sleep 10   # افزایش زمان برای اطمینان از نوشتن لاگ
+
+          URL=$( \
+            grep -oE \
+            'https://[-a-z0-9]+\.trycloudflare\.com' \
+            /tmp/cloudflared.log | \
+            head -1 \
+          )
+
+          # بررسی اینکه URL خالی نباشد
+          if [ -z "$URL" ]; then
+            echo "ERROR: Could not extract URL from cloudflared log"
+            echo "Cloudflared log content:"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          echo "URL=$URL" >> "$GITHUB_ENV"
+
+          echo
+          echo "=========================================="
+          echo "          REAL PTY TERMINAL ONLINE"
+          echo "=========================================="
+          echo
+          echo "URL:"
+          echo "$URL"
+          echo
+          echo "API:"
+          echo "$URL/command"
+          echo
+          echo "TOKEN:"
+          echo "$API_TOKEN"
+          echo
+          echo "=========================================="
+          echo "TEST:"
+          echo "=========================================="
+          echo
+          echo "curl -X POST \"$URL/command\" \\"
+          echo "  -H \"Authorization: Bearer $API_TOKEN\" \\"
+          echo "  -H \"Content-Type: application/json\" \\"
+          echo "  -d '{\"command\":\"whoami && id\"}'"
+          echo
+          echo "=========================================="
+
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # برای push کردن نیاز به توکن داریم (به‌طور خودکار GITHUB_TOKEN استفاده می‌شود)
           persist-credentials: true
 
-      - name: Send logs to repo (continue)
+      - name: Send logs to repo
+        env:
+          GH_TOKEN: ${{ github.token }}   # برای دستور gh
         run: |
           echo "Collecting logs into logs.txt ..."
 
@@ -48,12 +526,12 @@ jobs:
           echo "logs.txt created:"
           cat logs.txt
 
-          # تنظیم Git (اگر قبلاً تنظیم نشده باشد)
+          # تنظیم Git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # تنظیم remote با استفاده از GITHUB_TOKEN (اختیاری، ولی مطمئن‌تر است)
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          # تنظیم remote با توکن (اختیاری ولی مطمئن‌تر)
+          git remote set-url origin https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
 
           # افزودن فایل و commit
           git add logs.txt
