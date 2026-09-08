@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write      # برای commit کردن فایل
-      variables: write     # برای تنظیم متغیرهای مخزن
+      actions: write       # برای تنظیم متغیرهای مخزن
 
     steps:
 
