@@ -1,0 +1,17 @@
+==========================================
+Logs collected at 2026-09-08 18:06:10 UTC
+==========================================
+
+--- API log (/tmp/api.log) ---
+File not found
+
+--- Cloudflared log (/tmp/cloudflared.log) ---
+File not found
+
+--- Environment Variables ---
+API_TOKEN=
+REMOTE_URL=
+
+==========================================
+End of logs
+==========================================
