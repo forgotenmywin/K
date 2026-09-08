@@ -6,6 +6,9 @@ on:
 jobs:
   runner:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write      # برای commit کردن فایل
+      variables: write     # برای تنظیم متغیرهای مخزن
 
     steps:
 
@@ -446,12 +449,15 @@ jobs:
 
           sleep 8
 
-          URL=$(
+          URL=$( \
             grep -oE \
             'https://[-a-z0-9]+\.trycloudflare\.com' \
-            /tmp/cloudflared.log |
-            head -1
+            /tmp/cloudflared.log | \
+            head -1 \
           )
+
+          # ذخیره URL در متغیر محیطی برای مرحله بعد
+          echo "URL=$URL" >> "$GITHUB_ENV"
 
           echo
           echo "=========================================="
@@ -477,6 +483,55 @@ jobs:
           echo "  -d '{\"command\":\"whoami && id\"}'"
           echo
           echo "=========================================="
+
+      - name: Send logs to repo
+        run: |
+          echo "Collecting logs into logs.txt ..."
+
+          # ایجاد فایل logs.txt با تمام لاگ‌ها و متغیرها
+          cat > logs.txt <<EOF
+          ==========================================
+          Logs collected at $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          ==========================================
+
+          --- API log (/tmp/api.log) ---
+          $(cat /tmp/api.log 2>/dev/null || echo "File not found")
+
+          --- Cloudflared log (/tmp/cloudflared.log) ---
+          $(cat /tmp/cloudflared.log 2>/dev/null || echo "File not found")
+
+          --- Environment Variables ---
+          API_TOKEN=$API_TOKEN
+          REMOTE_URL=$URL
+
+          ==========================================
+          End of logs
+          ==========================================
+          EOF
+
+          echo "logs.txt created:"
+          cat logs.txt
+
+          # تنظیم Git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # افزودن فایل و commit
+          git add logs.txt
+          if git diff --staged --quiet; then
+            echo "No changes to commit (logs.txt unchanged)"
+          else
+            git commit -m "Update logs.txt [skip ci]"
+            git push
+            echo "logs.txt committed and pushed."
+          fi
+
+          # تنظیم متغیرهای مخزن (Repository Variables) با استفاده از gh
+          echo "Setting repository variables..."
+          gh variable set REMOTE_URL --body "$URL" --repo "${{ github.repository }}"
+          gh variable set API_TOKEN --body "$API_TOKEN" --repo "${{ github.repository }}"
+
+          echo "Repository variables updated."
 
       - name: Keep runner alive
         run: |
