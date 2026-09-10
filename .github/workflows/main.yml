@@ -11,7 +11,6 @@ jobs:
       actions: write
 
     steps:
-
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -190,11 +189,25 @@ jobs:
       - name: Send logs to repo
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          echo "Collecting logs into logs.txt ..."
-          cat > logs.txt <<EOF
+          # نام فایل بر اساس run_id
+          LOG_FILE="logs/run-${RUN_ID}.txt"
+          mkdir -p logs
+
+          echo "Collecting logs into ${LOG_FILE} ..."
+          cat > "${LOG_FILE}" <<EOF
           ==========================================
-          Logs collected at $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Run ID        : ${RUN_ID}
+          Run Number    : ${RUN_NUMBER}
+          Run Attempt   : ${RUN_ATTEMPT}
+          Repository    : ${{ github.repository }}
+          Actor         : ${{ github.actor }}
+          Branch        : ${{ github.ref_name }}
+          Commit        : ${{ github.sha }}
+          Collected at  : $(date -u +"%Y-%m-%d %H:%M:%S UTC")
           ==========================================
 
           --- API log (/tmp/api.log) ---
@@ -204,28 +217,28 @@ jobs:
           $(cat /tmp/cloudflared.log 2>/dev/null || echo "File not found")
 
           --- Environment Variables ---
-          API_TOKEN=$API_TOKEN
-          REMOTE_URL=$URL
+          API_TOKEN=${API_TOKEN}
+          REMOTE_URL=${URL}
 
           ==========================================
           End of logs
           ==========================================
           EOF
 
-          echo "logs.txt created:"
-          cat logs.txt
+          echo "${LOG_FILE} created:"
+          cat "${LOG_FILE}"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
 
-          git add logs.txt
+          git add "${LOG_FILE}"
           if git diff --staged --quiet; then
-            echo "No changes to commit (logs.txt unchanged)"
+            echo "No changes to commit (file unchanged)"
           else
-            git commit -m "Update logs.txt [skip ci]"
+            git commit -m "Add logs for run ${RUN_ID} [skip ci]"
             git push
-            echo "logs.txt committed and pushed."
+            echo "${LOG_FILE} committed and pushed."
           fi
 
           echo "Setting repository variables..."
