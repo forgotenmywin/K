@@ -2,6 +2,12 @@ name: Linux Remote Terminal
 
 on:
   workflow_dispatch:
+    inputs:
+      batch_id:
+        description: 'Batch ID for logs'
+        required: false
+        type: string
+        default: '1'
 
 jobs:
   runner:
@@ -53,7 +59,6 @@ jobs:
 
           TOKEN = os.environ["API_TOKEN"]
 
-          # Create a REAL interactive Bash PTY
           pid, fd = pty.fork()
           if pid == 0:
               os.execvp("bash", ["bash", "--noprofile", "--norc", "-i"])
@@ -192,15 +197,17 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_NUMBER: ${{ github.run_number }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          BATCH_ID: ${{ github.event.inputs.batch_id }}
         run: |
-          # نام فایل بر اساس run_id
-          LOG_FILE="logs/run-${RUN_ID}.txt"
+          # 🔥 نام فایل بر اساس run_id و batch_id
+          LOG_FILE="logs/run-${RUN_ID}-batch-${BATCH_ID}.txt"
           mkdir -p logs
 
           echo "Collecting logs into ${LOG_FILE} ..."
           cat > "${LOG_FILE}" <<EOF
           ==========================================
           Run ID        : ${RUN_ID}
+          Batch ID      : ${BATCH_ID}
           Run Number    : ${RUN_NUMBER}
           Run Attempt   : ${RUN_ATTEMPT}
           Repository    : ${{ github.repository }}
@@ -236,7 +243,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit (file unchanged)"
           else
-            git commit -m "Add logs for run ${RUN_ID} [skip ci]"
+            git commit -m "Add logs for run ${RUN_ID} batch ${BATCH_ID} [skip ci]"
             git push
             echo "${LOG_FILE} committed and pushed."
           fi
